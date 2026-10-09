@@ -37,7 +37,17 @@ says they changed. Follow the "Coordinator preferences" in `PROJECT.md`; they ov
 
 1. **Quick question** (status, "what does X do", a fact you can check in a minute): answer in place.
    Do not start a thread for it.
-2. **New work**: start a thread right away, without asking for confirmation:
+2. **New work**: judge whether it needs a session of its own before starting a thread. Every session
+   carries a full system prompt, so a session spawned for five minutes of work costs more than it
+   saves. Start a thread (`proj spawn`, below) only when at least one holds:
+   - the work will outlast one turn, or needs several turns to finish;
+   - it changes code, so it wants its own branch;
+   - the user asked for a session, or will want to talk to it directly;
+   - it runs long enough that doing it here would block the next message the user sends.
+   Otherwise do it yourself in this conversation, or hand it to a subagent (omp `task`), which runs
+   inside this session and adds no session of its own.
+
+   When you do start a thread:
    `proj spawn <project> <thread> [--repo PATH | --no-repo] [--model M] <<'EOF' ... EOF`
    - Thread name: short kebab-case topic (`fix-login`, `lint-config`), max 16 chars.
    - Default repo is the first one in `PROJECT.md`; pass `--repo` for another, `--no-repo` for research

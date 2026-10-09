@@ -8,13 +8,12 @@
 #       decision, so finished turns there never need the user.
 #   any other pane -> notify on `blocked` and `done`, like herdr's built-in toast.
 #
-# Each notification plays herdr's own sound (sounds/done.mp3, sounds/request.mp3),
-# the same one herdr plays with [ui.sound] on.
+# No sound of its own: the notification daemon (quickshell on Omarchy) plays the
+# one system sound, so a notification from here sounds like every other one.
 #
 # herdr injects HERDR_PLUGIN_EVENT_JSON ({"data":{"pane_id","agent_status","workspace_id",...}}),
 # HERDR_BIN_PATH and HERDR_PLUGIN_CONFIG_DIR. Optional settings go in
 # $HERDR_PLUGIN_CONFIG_DIR/config.env (`herdr plugin config-dir omp-session-orchestrator.notify`):
-#   PROJ_NOTIFY_SOUND=0   no sounds
 #   PROJ_NOTIFY_DEBUG=1   log every decision to stderr (`herdr plugin log list`)
 set -euo pipefail
 
@@ -23,7 +22,6 @@ config=${HERDR_PLUGIN_CONFIG_DIR:-}/config.env
 [[ -n ${HERDR_PLUGIN_CONFIG_DIR:-} && -f $config ]] && . "$config"
 herdr_bin=${HERDR_BIN_PATH:-herdr}
 event=${HERDR_PLUGIN_EVENT_JSON:-'{}'}
-sound_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sounds
 
 decide() {
 	[[ ${PROJ_NOTIFY_DEBUG:-0} == 1 ]] && printf '[proj-notify] pane=%s status=%s -> %s\n' "${pane:-?}" "${status:-?}" "$1" >&2
@@ -63,15 +61,7 @@ else
 	body=$title
 fi
 
-urgency=normal sound=done
-[[ $status == blocked ]] && urgency=critical sound=request
+urgency=normal
+[[ $status == blocked ]] && urgency=critical
 notify-send --app-name=herdr --urgency="$urgency" "$summary" "$body"
-if [[ ${PROJ_NOTIFY_SOUND:-1} == 1 && -f $sound_dir/$sound.mp3 ]]; then
-	# Same player order as herdr's src/sound.rs on Linux.
-	for player in paplay pw-play "ffplay -nodisp -autoexit -loglevel quiet" "mpg123 -q" "mpv --really-quiet"; do
-		command -v "${player%% *}" >/dev/null || continue
-		setsid -f $player "$sound_dir/$sound.mp3" </dev/null >/dev/null 2>&1
-		break
-	done
-fi
 decide "notify: $summary"

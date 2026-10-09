@@ -86,14 +86,13 @@ State lives in `$PROJ_ROOT/<project>/` (default `~/meta/projects/`):
 - A thread's tab closes by itself once it reports `done` and its turn ends, so finished threads hold
   no process. `proj send` resumes the same session in a new tab. Set `PROJ_KEEP_TABS=1` to keep tabs.
 - Closing the coordinator tab is fine too: the next `proj notify` or `proj open` resumes it.
-- The herdr plugin in `herdr-plugin/` replaces herdr's built-in toast and sound. In `proj:*`
+- The herdr plugin in `herdr-plugin/` replaces herdr's built-in toast. In `proj:*`
   workspaces it notifies **only** when a session is blocked on a dialog that you have to answer.
   Finished turns stay silent: threads report to the coordinator, and the coordinator asks you through
   omp's `ask` tool when it needs a decision. Other panes keep herdr's behavior: notify on done and
-  blocked outside the focused tab, with herdr's own `done`/`request` sounds (bundled in
-  `herdr-plugin/sounds`, Apache-2.0, see `NOTICE`). Settings go in
-  `$(herdr plugin config-dir omp-session-orchestrator.notify)/config.env`: `PROJ_NOTIFY_SOUND=0`
-  mutes sounds, `PROJ_NOTIFY_DEBUG=1` logs decisions.
+  blocked outside the focused tab. Sound comes from the notification daemon itself, so every
+  notification sounds the same. `PROJ_NOTIFY_DEBUG=1` in
+  `$(herdr plugin config-dir omp-session-orchestrator.notify)/config.env` logs decisions.
 
 herdr's own toasts and sounds can't be filtered per pane, so turn them off when you use the plugin:
 
