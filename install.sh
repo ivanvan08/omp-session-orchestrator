@@ -18,11 +18,11 @@ echo "proj   -> $bin_dir/proj"
 echo "skill  -> $skills_dir/project-coordinator"
 
 if command -v herdr >/dev/null; then
-	if herdr plugin list --json | jq -e '[.. | .plugin_id? // empty] | index("omp-projects.notify")' >/dev/null; then
-		echo "plugin -> omp-projects.notify (already linked)"
+	if herdr plugin list --json | jq -e '[.. | .plugin_id? // empty] | index("omp-session-orchestrator.notify")' >/dev/null; then
+		echo "plugin -> omp-session-orchestrator.notify (already linked)"
 	else
 		herdr plugin link "$here/herdr-plugin" >/dev/null
-		echo "plugin -> omp-projects.notify (linked)"
+		echo "plugin -> omp-session-orchestrator.notify (linked)"
 	fi
 	cat <<'EOF'
 
