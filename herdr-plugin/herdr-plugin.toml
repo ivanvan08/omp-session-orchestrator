@@ -1,0 +1,10 @@
+id = "omp-projects.notify"
+name = "proj notifications"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Desktop notifications for agent state changes that stay quiet for proj threads unless the user must act"
+platforms = ["linux"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["bash", "notify.sh"]

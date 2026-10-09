@@ -1,0 +1,548 @@
+#!/usr/bin/env bash
+# proj - Claude-Projects-style orchestration of omp sessions on top of herdr.
+#
+# A project is one coordinator session plus worker "threads". Every thread is a
+# full omp session in its own herdr tab and, for code work, its own git worktree.
+# State lives in $PROJ_ROOT/<project>/ (PROJECT.md, MEMORY.md, threads.json).
+set -euo pipefail
+
+PROJ_ROOT="${PROJ_ROOT:-$HOME/meta/projects}"
+PROJ_AGENT_KIND="${PROJ_AGENT_KIND:-omp}"
+PROJ_START_TIMEOUT_MS="${PROJ_START_TIMEOUT_MS:-60000}"
+
+die() { printf 'proj: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'proj: %s\n' "$*" >&2; }
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+usage() {
+	cat <<'EOF'
+usage: proj <command> [args]
+
+  init <project> [--goal TEXT] [--repo PATH]...   create a project and start its coordinator
+  open <project>                                  (re)create the workspace / coordinator if gone
+  list                                            list projects
+  spawn <project> <thread> [--repo PATH | --no-repo] [--base REF] [--model M] [--task TEXT]
+                                                  start a thread (task text from --task or stdin)
+  send <project> <thread> [--task TEXT]           follow-up to an existing thread (revives it if needed)
+  status <project> [--json]                       overview of all threads
+  report <project> <thread>                       print the thread's last final message
+  notify <project> <thread> <done|blocked|needs-input> <summary>
+                                                  thread -> coordinator report (run by threads)
+  remember <project> <text>                       append a line to project MEMORY.md
+  resolve <project> <thread> [--close] [--remove-worktree]
+                                                  mark a thread resolved
+
+env: PROJ_ROOT (default ~/meta/projects), PROJ_AGENT_KIND (default omp)
+EOF
+}
+
+for dep in herdr jq git flock; do
+	command -v "$dep" >/dev/null || die "missing dependency: $dep"
+done
+
+valid_name() {
+	[[ $1 =~ ^[a-z][a-z0-9-]{0,15}$ ]] ||
+		die "invalid $2 name '$1': lowercase letters, digits, '-'; starts with a letter; max 16 chars"
+}
+
+pdir() { printf '%s/%s' "$PROJ_ROOT" "$1"; }
+reg() { printf '%s/threads.json' "$(pdir "$1")"; }
+require_project() { [[ -f $(reg "$1") ]] || die "no project '$1' (create it: proj init $1)"; }
+
+# reg_get <project> [jq options...] <filter>
+reg_get() {
+	local p=$1
+	shift
+	jq -r "$@" "$(reg "$p")"
+}
+
+# reg_update <project> [jq options...] <filter> - atomic, serialized by flock.
+reg_update() {
+	local p=$1 f tmp
+	shift
+	f=$(reg "$p")
+	(
+		flock 9
+		tmp=$(mktemp "$f.XXXXXX")
+		if jq "$@" "$f" >"$tmp"; then
+			mv "$tmp" "$f"
+		else
+			rm -f "$tmp"
+			exit 1
+		fi
+	) 9>"$f.lock"
+}
+
+thread_field() { reg_get "$1" --arg t "$2" ".threads[\$t].$3 // empty"; }
+require_thread() {
+	[[ -n $(reg_get "$1" --arg t "$2" '.threads[$t] // empty | .agent') ]] ||
+		die "no thread '$2' in project '$1'"
+}
+
+# --- herdr probes ------------------------------------------------------------
+# A probe answers "does it exist"; its stderr is the expected not-found error.
+
+workspace_alive() { [[ -n $1 ]] && herdr workspace get "$1" >/dev/null 2>&1; }
+pane_alive() { [[ -n $1 ]] && herdr pane get "$1" >/dev/null 2>&1; }
+
+# agent_state <pane> -> idle|working|blocked|done|unknown|exited|gone
+agent_state() {
+	local pane=$1 out
+	if [[ -n $pane ]] && out=$(herdr agent get "$pane" 2>/dev/null); then
+		jq -r '.result.agent.agent_status' <<<"$out"
+	elif pane_alive "$pane"; then
+		echo exited
+	else
+		echo gone
+	fi
+}
+
+agent_session_path() {
+	herdr agent get "$1" 2>/dev/null | jq -r '.result.agent.agent_session.value // empty'
+}
+
+# start_agent <name> <pane> [session-to-resume] [extra omp args...]
+start_agent() {
+	local name=$1 pane=$2 session=${3:-}
+	shift 3 || shift $#
+	local args=("$@")
+	[[ -n $session && -f $session ]] && args=(--resume "$session" "${args[@]}")
+	if ((${#args[@]})); then
+		herdr agent start "$name" --kind "$PROJ_AGENT_KIND" --pane "$pane" --timeout "$PROJ_START_TIMEOUT_MS" -- "${args[@]}" >/dev/null
+	else
+		herdr agent start "$name" --kind "$PROJ_AGENT_KIND" --pane "$pane" --timeout "$PROJ_START_TIMEOUT_MS" >/dev/null
+	fi
+}
+
+new_tab() { # new_tab <workspace> <cwd> <label> -> prints "<tab_id> <pane_id>"
+	herdr tab create --workspace "$1" --cwd "$2" --label "$3" --env "PROJ_ROOT=$PROJ_ROOT" --no-focus |
+		jq -r '"\(.result.tab.tab_id) \(.result.root_pane.pane_id)"'
+}
+
+prompt_agent() { herdr agent prompt "$1" "$2" >/dev/null; }
+
+# --- git ---------------------------------------------------------------------
+
+default_branch() {
+	local r=$1 b
+	if b=$(git -C "$r" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null); then
+		b=${b#origin/}
+		if git -C "$r" show-ref --verify --quiet "refs/heads/$b"; then echo "$b"; else echo "origin/$b"; fi
+	else
+		git -C "$r" symbolic-ref --short HEAD
+	fi
+}
+
+# --- commands ----------------------------------------------------------------
+
+cmd_init() {
+	(($# >= 1)) || die "usage: proj init <project> [--goal TEXT] [--repo PATH]..."
+	local p=$1 goal="" r d
+	shift
+	valid_name "$p" project
+	local repos=()
+	while (($#)); do
+		case $1 in
+		--goal) goal=${2:?--goal needs a value}; shift 2 ;;
+		--repo)
+			r=$(git -C "${2:?--repo needs a path}" rev-parse --show-toplevel) || die "not a git repository: $2"
+			repos+=("$r")
+			shift 2
+			;;
+		*) die "init: unknown option $1" ;;
+		esac
+	done
+	d=$(pdir "$p")
+	[[ -e $d ]] && die "project already exists: $d"
+	mkdir -p "$d/tasks"
+
+	{
+		printf '# Project: %s\n\n## Goal\n\n%s\n\n## Repositories\n\n' "$p" "${goal:-_(not set)_}"
+		if ((${#repos[@]})); then printf -- '- `%s`\n' "${repos[@]}"; else echo '_(none; threads work in the project folder)_'; fi
+		cat <<'EOF'
+
+The first repository is the default for new threads.
+
+## Instructions for every thread
+
+- Work only in your own git worktree and branch (`proj/<thread>`); commit there.
+- Open a draft pull request only when the user asks or when the change is a concrete fix ready for review.
+- Before calling work done, run the repository's tests and linters and quote the summary lines in your report.
+- If something you need is missing (repository, secret, API, tool), say exactly what and stop. Do not mock, substitute, or guess.
+- Never merge, force-push, or change CI configuration without the user's go-ahead in your tab.
+
+## Coordinator preferences
+
+- Start threads immediately; do not ask for confirmation first.
+- Reuse an existing thread for follow-ups in the same area.
+EOF
+	} >"$d/PROJECT.md"
+
+	printf '# Project memory: %s\n\nRequirements, decisions and pitfalls every thread must know.\nAppend with `proj remember %s "<text>"`; edit freely.\n\n' "$p" "$p" >"$d/MEMORY.md"
+
+	local repos_json='[]'
+	((${#repos[@]})) && repos_json=$(printf '%s\n' "${repos[@]}" | jq -R . | jq -s .)
+	jq -n --arg name "$p" --arg goal "$goal" --argjson repos "$repos_json" --arg now "$(now)" \
+		'{name: $name, goal: $goal, repos: $repos, created: $now, workspace: null, coord: null, threads: {}}' >"$d/threads.json"
+
+	cmd_open "$p"
+}
+
+cmd_open() {
+	(($# == 1)) || die "usage: proj open <project>"
+	local p=$1 d ws out fresh_pane="" tab cpane state session
+	require_project "$p"
+	d=$(pdir "$p")
+
+	ws=$(reg_get "$p" '.workspace // empty')
+	if ! workspace_alive "$ws"; then
+		out=$(herdr workspace create --cwd "$d" --label "proj:$p" --env "PROJ_ROOT=$PROJ_ROOT" --no-focus)
+		ws=$(jq -r '.result.workspace.workspace_id' <<<"$out")
+		tab=$(jq -r '.result.tab.tab_id' <<<"$out")
+		fresh_pane=$(jq -r '.result.root_pane.pane_id' <<<"$out")
+		herdr tab rename "$tab" coord >/dev/null
+		reg_update "$p" --arg ws "$ws" '.workspace = $ws'
+	fi
+
+	cpane=$(reg_get "$p" '.coord.pane // empty')
+	state=$(agent_state "$cpane")
+	if [[ $state == gone || $state == exited ]]; then
+		session=$(reg_get "$p" '.coord.session // empty')
+		if [[ $state == exited ]]; then
+			:
+		elif [[ -n $fresh_pane ]]; then
+			cpane=$fresh_pane
+		else
+			out=$(new_tab "$ws" "$d" coord)
+			read -r _ cpane <<<"$out"
+		fi
+		start_agent "$p-coord" "$cpane" "$session"
+		reg_update "$p" --arg pane "$cpane" --arg name "$p-coord" '.coord = ((.coord // {}) + {pane: $pane, agent: $name})'
+		if [[ -z $session || ! -f $session ]]; then
+			prompt_agent "$cpane" "You are the coordinator of project '$p'. Read skill://project-coordinator, then $d/PROJECT.md and $d/MEMORY.md, run \`proj status $p\`, and wait for the user's work."
+		fi
+		state=started
+	fi
+	session=$(agent_session_path "$cpane")
+	[[ -n $session ]] && reg_update "$p" --arg s "$session" '.coord.session = $s'
+	printf 'project %s: workspace %s, coordinator %s (%s)\n' "$p" "$ws" "$cpane" "$state"
+}
+
+cmd_list() {
+	local f
+	shopt -s nullglob
+	printf '%-16s %-7s %-9s %s\n' PROJECT THREADS WORKSPACE GOAL
+	for f in "$PROJ_ROOT"/*/threads.json; do
+		jq -r '[.name, ([.threads[] | select(.state != "resolved")] | length | tostring), (.workspace // "-"), .goal] | @tsv' "$f" |
+			while IFS=$'\t' read -r n c w g; do printf '%-16s %-7s %-9s %s\n' "$n" "$c" "$w" "$g"; done
+	done
+}
+
+# read_task_arg -> sets TASK from --task or stdin
+read_task_arg() {
+	if [[ -z ${TASK:-} && ! -t 0 ]]; then TASK=$(cat); fi
+	[[ -n ${TASK//[[:space:]]/} ]] || die "empty task: pass --task TEXT or pipe it on stdin"
+}
+
+# task_title -> first line of TASK that is neither blank nor a markdown heading
+task_title() {
+	awk 'NF && !/^[[:space:]]*#/ { sub(/^[[:space:]]*[-*][[:space:]]+/, ""); print; exit }' <<<"$TASK"
+}
+
+# deliver <project> <thread> <with-brief:0|1> - writes the task file and prompts the thread.
+deliver() {
+	local p=$1 t=$2 brief=$3 d n file pane cwd branch base wt
+	d=$(pdir "$p")
+	n=$(reg_get "$p" --arg t "$t" '.threads[$t].turns + 1')
+	file="$d/tasks/$t-$n.md"
+	pane=$(thread_field "$p" "$t" pane)
+	if ((brief)); then
+		wt=$(thread_field "$p" "$t" worktree)
+		branch=$(thread_field "$p" "$t" branch)
+		base=$(thread_field "$p" "$t" base)
+		cwd=${wt:-$d}
+		{
+			printf '# Thread `%s` of project `%s`\n\n' "$t" "$p"
+			printf 'The project coordinator started you. You are a full session; the user may also talk to you directly in this tab.\n\n'
+			printf '## Before you start\n\n'
+			printf -- '- Read the project brief `%s/PROJECT.md` and project memory `%s/MEMORY.md`, and follow them.\n' "$d" "$d"
+			if [[ -n $wt ]]; then
+				printf -- '- Your working directory is `%s`, a git worktree on branch `%s` created from `%s`. Work and commit only there.\n\n' "$cwd" "$branch" "$base"
+			else
+				printf -- '- Your working directory is `%s`.\n\n' "$cwd"
+			fi
+			printf '## While you work\n\n'
+			printf -- '- A project-wide requirement, decision or pitfall worth keeping (including corrections from the user): record it with `proj remember %s "<one line>"`. Facts useful beyond this project go to your global memory instead.\n' "$p"
+			printf -- '- If something you need is missing, say exactly what and stop. Do not mock, substitute, or guess.\n'
+			printf -- '- Do not use the `ask` tool: it pings the user directly. Questions and decisions go to the coordinator with `proj notify ... needs-input`; it answers or asks the user.\n\n'
+			printf '## Every time you finish a turn\n\n'
+			printf '1. As your last tool call, run `proj notify %s %s <done|blocked|needs-input> "<2-4 sentence summary>"`. That is how the coordinator learns about your result.\n' "$p" "$t"
+			printf '2. Then write your final message: first line `STATUS: done|blocked|needs-input`, then what changed, how you verified it, branch/PR, and open questions.\n\n'
+			printf 'After `done` your tab closes when the turn ends; a follow-up resumes this same session.\n\n'
+			printf '## Task\n\n'
+		} >"$file"
+	else
+		printf '# Follow-up for thread `%s`\n\nSame rules as before, including `proj notify %s %s ...` at the end of the turn.\n\n## Task\n\n' "$t" "$p" "$t" >"$file"
+	fi
+	printf '%s\n' "$TASK" >>"$file"
+	prompt_agent "$pane" "Read $file and carry it out."
+	reg_update "$p" --arg t "$t" --arg now "$(now)" '.threads[$t].turns += 1 | .threads[$t].updated = $now | .threads[$t].last_status = "working"'
+	printf 'thread %s/%s: task %s delivered to %s\n' "$p" "$t" "$n" "$pane"
+}
+
+cmd_spawn() {
+	(($# >= 2)) || die "usage: proj spawn <project> <thread> [--repo PATH | --no-repo] [--base REF] [--model M] [--task TEXT]"
+	local p=$1 t=$2 repo="" norepo=0 base="" model="" top wt="" branch="" cwd ws tab pane
+	shift 2
+	TASK=""
+	require_project "$p"
+	valid_name "$t" thread
+	[[ -z $(reg_get "$p" --arg t "$t" '.threads[$t] // empty | .agent') ]] || die "thread '$t' already exists (follow up with: proj send $p $t)"
+	while (($#)); do
+		case $1 in
+		--repo) repo=${2:?--repo needs a path}; shift 2 ;;
+		--no-repo) norepo=1; shift ;;
+		--base) base=${2:?--base needs a ref}; shift 2 ;;
+		--model) model=${2:?--model needs a value}; shift 2 ;;
+		--task) TASK=${2:?--task needs text}; shift 2 ;;
+		*) die "spawn: unknown option $1" ;;
+		esac
+	done
+	read_task_arg
+	((norepo)) || [[ -n $repo ]] || repo=$(reg_get "$p" '.repos[0] // empty')
+
+	cmd_open "$p" >/dev/null
+	ws=$(reg_get "$p" '.workspace')
+
+	if [[ -n $repo ]] && ((!norepo)); then
+		top=$(git -C "$repo" rev-parse --show-toplevel) || die "not a git repository: $repo"
+		base=${base:-$(default_branch "$top")}
+		branch="proj/$t"
+		wt="$(dirname "$top")/$(basename "$top").wt/$t"
+		git -C "$top" show-ref --verify --quiet "refs/heads/$branch" && die "branch $branch already exists in $top"
+		git -C "$top" worktree add -q -b "$branch" "$wt" "$base"
+		cwd=$wt
+	else
+		top="" base=""
+		cwd=$(pdir "$p")
+	fi
+
+	out=$(new_tab "$ws" "$cwd" "$t")
+	read -r tab pane <<<"$out"
+	if [[ -n $model ]]; then start_agent "$p-$t" "$pane" "" --model "$model"; else start_agent "$p-$t" "$pane" ""; fi
+
+	reg_update "$p" --arg t "$t" --arg task "$(task_title)" --arg repo "$top" --arg wt "$wt" \
+		--arg branch "$branch" --arg base "$base" --arg tab "$tab" --arg pane "$pane" --arg agent "$p-$t" --arg now "$(now)" \
+		'.threads[$t] = {task: $task, repo: $repo, worktree: $wt, branch: $branch, base: $base, tab: $tab, pane: $pane,
+		  agent: $agent, session: null, state: "active", last_status: null, last_summary: null, turns: 0, created: $now, updated: $now}'
+	deliver "$p" "$t" 1
+}
+
+# ensure_thread <project> <thread> - revive the thread's omp session if its pane or process is gone.
+ensure_thread() {
+	local p=$1 t=$2 pane state session ws cwd tab
+	pane=$(thread_field "$p" "$t" pane)
+	state=$(agent_state "$pane")
+	case $state in
+	gone | exited)
+		session=$(thread_field "$p" "$t" session)
+		[[ -n $session ]] || die "thread $t is $state and has no recorded session to resume"
+		if [[ $state == gone ]]; then
+			cmd_open "$p" >/dev/null
+			ws=$(reg_get "$p" '.workspace')
+			cwd=$(thread_field "$p" "$t" worktree)
+			out=$(new_tab "$ws" "${cwd:-$(pdir "$p")}" "$t")
+			read -r tab pane <<<"$out"
+			reg_update "$p" --arg t "$t" --arg tab "$tab" --arg pane "$pane" '.threads[$t].tab = $tab | .threads[$t].pane = $pane'
+		fi
+		start_agent "$p-$t" "$pane" "$session"
+		warn "revived thread $t from $session"
+		;;
+	blocked) die "thread $t is waiting on a dialog; answer it in its tab (herdr agent focus $pane)" ;;
+	esac
+	session=$(agent_session_path "$pane")
+	[[ -n $session ]] && reg_update "$p" --arg t "$t" --arg s "$session" '.threads[$t].session = $s'
+	return 0
+}
+
+cmd_send() {
+	(($# >= 2)) || die "usage: proj send <project> <thread> [--task TEXT]"
+	local p=$1 t=$2
+	shift 2
+	TASK=""
+	require_project "$p"
+	require_thread "$p" "$t"
+	while (($#)); do
+		case $1 in
+		--task) TASK=${2:?--task needs text}; shift 2 ;;
+		*) die "send: unknown option $1" ;;
+		esac
+	done
+	read_task_arg
+	[[ $(thread_field "$p" "$t" state) == resolved ]] && reg_update "$p" --arg t "$t" '.threads[$t].state = "active"'
+	ensure_thread "$p" "$t"
+	deliver "$p" "$t" 0
+}
+
+pr_info() { # pr_info <repo> <branch> -> "<state> <url>" or "-"
+	local repo=$1 branch=$2 out
+	[[ -n $repo && -n $branch ]] || { echo -; return; }
+	command -v gh >/dev/null || { echo -; return; }
+	git -C "$repo" remote get-url origin 2>/dev/null | grep -q 'github\.com' || { echo -; return; }
+	if out=$(cd "$repo" && gh pr list --head "$branch" --state all --limit 1 --json state,isDraft,url 2>&1); then
+		jq -r 'if length == 0 then "-" else .[0] | "\(if .isDraft then "DRAFT" else .state end) \(.url)" end' <<<"$out"
+	else
+		echo "error"
+	fi
+}
+
+cmd_status() {
+	(($# >= 1)) || die "usage: proj status <project> [--json]"
+	local p=$1 json=0 t pane state session pr group rows='[]' cpane
+	require_project "$p"
+	[[ ${2:-} == --json ]] && json=1
+	while IFS= read -r t; do
+		[[ -n $t ]] || continue
+		pane=$(thread_field "$p" "$t" pane)
+		state=$(agent_state "$pane")
+		if [[ $state != gone && $state != exited ]]; then
+			session=$(agent_session_path "$pane")
+			[[ -n $session ]] && reg_update "$p" --arg t "$t" --arg s "$session" '.threads[$t].session = $s'
+		fi
+		pr=$(pr_info "$(thread_field "$p" "$t" repo)" "$(thread_field "$p" "$t" branch)")
+		rows=$(jq --arg t "$t" --arg state "$state" --arg pr "$pr" --slurpfile reg "$(reg "$p")" \
+			'. + [$reg[0].threads[$t] + {thread: $t, live: $state, pr: $pr}]' <<<"$rows")
+	done < <(reg_get "$p" '.threads | keys[]')
+
+	rows=$(jq '[.[] | . + {group: (
+		if .state == "resolved" then "resolved"
+		elif .live == "blocked" or ((.live == "idle" or .live == "done") and (.last_status == "blocked" or .last_status == "needs-input")) then "waiting-on-you"
+		elif .live == "working" then "working"
+		elif (.pr | test("^(OPEN|DRAFT) ")) then "ready-for-review"
+		elif (.pr | test("^MERGED ")) then "landed"
+		elif (.live == "gone" or .live == "exited") and .last_status != "done" then "offline"
+		else "idle" end)}]
+		| sort_by({"waiting-on-you":0,"ready-for-review":1,"working":2,"idle":3,"landed":4,"offline":5,"resolved":6}[.group])' <<<"$rows")
+
+	if ((json)); then
+		jq . <<<"$rows"
+		return
+	fi
+	cpane=$(reg_get "$p" '.coord.pane // empty')
+	printf 'project %s - %s\ncoordinator: %s (%s)\n\n' "$p" "$(reg_get "$p" '.goal')" "${cpane:--}" "$(agent_state "$cpane")"
+	jq -r '(["GROUP","THREAD","LIVE","REPORTED","BRANCH","PR","TASK"] | @tsv),
+		(.[] | [.group, .thread, .live, (.last_status // "-"), (if .branch == "" then "-" else .branch end), .pr, (.task | .[0:60])] | @tsv)' <<<"$rows" |
+		column -t -s $'\t'
+}
+
+cmd_report() {
+	(($# == 2)) || die "usage: proj report <project> <thread>"
+	local p=$1 t=$2 pane session summary
+	require_project "$p"
+	require_thread "$p" "$t"
+	pane=$(thread_field "$p" "$t" pane)
+	session=$(agent_session_path "$pane")
+	[[ -n $session ]] || session=$(thread_field "$p" "$t" session)
+	summary=$(thread_field "$p" "$t" last_summary)
+	[[ -n $summary ]] && printf 'notify summary (%s): %s\n\n' "$(thread_field "$p" "$t" last_status)" "$summary"
+	[[ -n $session && -f $session ]] || die "no session file recorded for thread $t yet"
+	jq -c 'select(.type == "message" and .message.role == "assistant")
+		| [.message.content[]? | select(.type == "text") | .text] | join("") | select(length > 0)' "$session" |
+		tail -n 1 | jq -r .
+}
+
+cmd_notify() {
+	(($# >= 4)) || die "usage: proj notify <project> <thread> <done|blocked|needs-input> <summary>"
+	local p=$1 t=$2 status=$3 summary cpane state session
+	shift 3
+	summary=$*
+	summary=${summary//$'\n'/ }
+	require_project "$p"
+	require_thread "$p" "$t"
+	[[ $status =~ ^(done|blocked|needs-input)$ ]] || die "status must be done, blocked or needs-input"
+	session=$(agent_session_path "$(thread_field "$p" "$t" pane)")
+	reg_update "$p" --arg t "$t" --arg s "$status" --arg m "$summary" --arg sess "$session" --arg now "$(now)" \
+		'.threads[$t].last_status = $s | .threads[$t].last_summary = $m | .threads[$t].updated = $now
+		 | if $sess != "" then .threads[$t].session = $sess else . end'
+	((${PROJ_KEEP_TABS:-0})) || [[ $status != done ]] || close_when_settled "$(thread_field "$p" "$t" pane)" "$(thread_field "$p" "$t" tab)"
+
+	cpane=$(reg_get "$p" '.coord.pane // empty')
+	state=$(agent_state "$cpane")
+	case $state in
+	gone | exited)
+		cmd_open "$p" >/dev/null
+		cpane=$(reg_get "$p" '.coord.pane')
+		;;
+	blocked)
+		warn "coordinator is waiting on a dialog; status recorded in the registry, it will show in proj status"
+		return 0
+		;;
+	esac
+	prompt_agent "$cpane" "[thread $t] STATUS: $status - $summary (full report: proj report $p $t)"
+	echo "coordinator notified"
+}
+
+# close_when_settled <pane> <tab> - in the background, wait for the thread's turn to end, then
+# close its tab so finished threads hold no process. `proj send` resumes the session later.
+# A tab the user is looking at stays open.
+close_when_settled() {
+	local pane=$1 tab=$2
+	[[ -n $pane && -n $tab ]] || return 0
+	setsid -f bash -c '
+		herdr agent wait "$1" --until idle --until done --timeout 1800000 >/dev/null 2>&1 || exit 0
+		ws=$(herdr tab get "$2" | jq -r ".result.tab.workspace_id") || exit 0
+		herdr workspace get "$ws" | jq -e --arg tab "$2" ".result.workspace.focused and .result.workspace.active_tab_id == \$tab" >/dev/null && exit 0
+		herdr tab close "$2" >/dev/null
+	' close-thread "$pane" "$tab" </dev/null >/dev/null 2>&1
+}
+
+cmd_remember() {
+	(($# >= 2)) || die "usage: proj remember <project> <text>"
+	local p=$1 m
+	shift
+	require_project "$p"
+	m="$(pdir "$p")/MEMORY.md"
+	(
+		flock 9
+		printf -- '- %s: %s\n' "$(date +%F)" "$*" >>"$m"
+	) 9>"$m.lock"
+	echo "remembered in $m"
+}
+
+cmd_resolve() {
+	(($# >= 2)) || die "usage: proj resolve <project> <thread> [--close] [--remove-worktree]"
+	local p=$1 t=$2 close=0 rmwt=0 tab wt repo
+	shift 2
+	require_project "$p"
+	require_thread "$p" "$t"
+	while (($#)); do
+		case $1 in
+		--close) close=1; shift ;;
+		--remove-worktree) rmwt=1; shift ;;
+		*) die "resolve: unknown option $1" ;;
+		esac
+	done
+	if ((rmwt)); then
+		wt=$(thread_field "$p" "$t" worktree)
+		repo=$(thread_field "$p" "$t" repo)
+		[[ -n $wt ]] || die "thread $t has no worktree"
+		git -C "$repo" worktree remove "$wt"
+		reg_update "$p" --arg t "$t" '.threads[$t].worktree = ""'
+		echo "worktree removed: $wt (branch $(thread_field "$p" "$t" branch) kept)"
+	fi
+	if ((close)); then
+		tab=$(thread_field "$p" "$t" tab)
+		if herdr tab get "$tab" >/dev/null 2>&1; then herdr tab close "$tab" >/dev/null; fi
+		echo "tab closed: $tab"
+	fi
+	reg_update "$p" --arg t "$t" --arg now "$(now)" '.threads[$t].state = "resolved" | .threads[$t].updated = $now'
+	echo "thread $p/$t resolved"
+}
+
+cmd=${1:-}
+(($#)) && shift
+case $cmd in
+init | open | list | spawn | send | status | report | notify | remember | resolve) "cmd_$cmd" "$@" ;;
+-h | --help | help | "") usage ;;
+*) die "unknown command '$cmd' (proj --help)" ;;
+esac
