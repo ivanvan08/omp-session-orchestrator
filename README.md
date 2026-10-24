@@ -90,7 +90,8 @@ State lives in `$PROJ_ROOT/<project>/` (default `~/meta/projects/`):
   workspaces it notifies **only** when a session is blocked on a dialog that you have to answer.
   Finished turns stay silent: threads report to the coordinator, and the coordinator asks you through
   omp's `ask` tool when it needs a decision. Other panes keep herdr's behavior: notify on done and
-  blocked outside the focused tab. Sound comes from the notification daemon itself, so every
+  blocked unless the pane is in the focused tab and the herdr terminal window has Hyprland focus
+  (checked with `hyprctl activewindow`). Sound comes from the notification daemon itself, so every
   notification sounds the same. `PROJ_NOTIFY_DEBUG=1` in
   `$(herdr plugin config-dir omp-session-orchestrator.notify)/config.env` logs decisions.
 

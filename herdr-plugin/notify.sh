@@ -39,9 +39,26 @@ tab=$(jq -r '.result.pane.tab_id // empty' <<<"$pane_json")
 ws_json=$("$herdr_bin" workspace get "$ws" 2>/dev/null) || ws_json='{}'
 ws_label=$(jq -r '.result.workspace.label // empty' <<<"$ws_json")
 
-# The user is looking at it: herdr's built-in toast stays quiet here as well.
+# The user is looking at it: the pane is in the active tab of herdr's focused workspace
+# AND the terminal running herdr has compositor focus. Same rule as herdr's built-in
+# toast (is_active_tab && outer_terminal_focus != false): herdr reports `done` for the
+# active tab once its window loses focus, but its API does not expose that focus, so
+# ask Hyprland whether the active window is an ancestor of a herdr process.
+terminal_focused() {
+	local win p
+	win=$(hyprctl activewindow -j 2>/dev/null) || return 0 # focus unknown: stay quiet, as herdr does
+	win=$(jq -r '.pid // empty' <<<"$win" 2>/dev/null)
+	[[ $win =~ ^[0-9]+$ ]] || return 1 # no focused window
+	for p in $(pgrep -x herdr); do
+		while [[ $p =~ ^[0-9]+$ && $p -gt 1 ]]; do
+			[[ $p == "$win" ]] && return 0
+			p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+		done
+	done
+	return 1
+}
 if [[ $(jq -r '.result.workspace.focused // false' <<<"$ws_json") == true &&
-	$(jq -r '.result.workspace.active_tab_id // empty' <<<"$ws_json") == "$tab" ]]; then
+	$(jq -r '.result.workspace.active_tab_id // empty' <<<"$ws_json") == "$tab" ]] && terminal_focused; then
 	decide "drop: focused"
 	exit 0
 fi
